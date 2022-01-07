@@ -1,0 +1,154 @@
+resolver ${VICARY_RESOLVER};
+proxy_cache_path ${VICARY_STORE} levels=2:2:2 keys_zone=cache:100m inactive=${VICARY_CACHE_INACTIVE} min_free=${VICARY_CACHE_FREE_SIZE} use_temp_path=off;
+
+map $args $non_url_args {
+   default "";
+   "~(.*)\&?url=[^&]+\&?(.*)" "?$1$2";
+}
+
+map $arg_scope $auth_backend {
+    default "";
+    "~repository%3A(docker\.io|library)%2F" "https://auth.docker.io/token";
+}
+
+map $arg_scope $auth_scope {
+    default "";
+    "~repository%3Alibrary%2F([^&]*)" "repository%3Alibrary%2F$1";
+    "~repository%3A[^%]*%2F([^&]*)" "repository%3A$1";
+}
+
+map $arg_scope $auth_service {
+    default "";
+    "~repository%3A(docker\.io|library)%2F" "registry.docker.io";
+}
+
+map "${VICARY_DOCKER_IO_B64_AUTH}|$arg_scope" $auth_header {
+    default "";
+    "~(\S+)\|repository%3A(docker\.io|library)%2F" "Basic ${VICARY_DOCKER_IO_B64_AUTH}";
+}
+
+map $arg_url $ok_fetch_url {
+    default "";
+    "~^https://cdn\d+\.quay\.io/" "ok";
+    "~^https://production\.cloudflare\.docker\.com/registry-v2/docker/registry" "ok";
+}
+
+server {
+    listen       ${VICARY_PORT};
+    server_name  localhost;
+
+    client_max_body_size 0; # disable any limits to avoid HTTP 413 for large image uploads
+
+    # required to avoid HTTP 411: see Issue #1486 (https://github.com/docker/docker/issues/1486)
+    chunked_transfer_encoding on;
+
+    sendfile on;
+    sendfile_max_chunk 10m;
+    aio on;
+    directio 4m;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    add_header X-Vicary-Cache $upstream_cache_status;
+
+    location = /health/ {
+        add_header Content-Type text/plain;
+        return 200 '${VICARY_HEALTH_RESPONSE_BODY}';
+    }
+
+    location /_fetch/ {
+        limit_except GET {deny all;}
+        if ($ok_fetch_url = "") {
+            add_header Content-Type text/plain;
+            return 401 "Unauthorized url: $arg_url";
+        }
+        if ($arg_url !~ "https?://.+") {
+            add_header Content-Type text/plain;
+            return 400 "Invalid/missing 'url' parameter";
+        }
+        include /etc/nginx/proxy.conf;
+
+        proxy_set_header Authorization "";
+        proxy_cache cache;
+        proxy_cache_key $arg_url;
+
+        set $c_uri "";
+        proxy_ssl_server_name on;  # pass SNI to avoid a bug in cloudfront which rejects requests without it.
+        proxy_pass $arg_url$non_url_args;
+    }
+
+    location = /v2/ {
+        proxy_hide_header Www-Authenticate; 
+        add_header Www-Authenticate 'Bearer realm="${VICARY_SCHEME}://$host/token",service="$host"' always;
+        return 401;
+    }
+
+    location /token {
+        if ($auth_backend = "") {
+            add_header Content-Type application/json;
+            return 200 '{"token":"bogus"}';
+        }
+
+        proxy_set_header Authorization "$auth_header";
+        set $c_uri "";
+        proxy_pass $auth_backend?scope=$auth_scope&service=$auth_service;
+    }
+
+    location /v2/docker.io/ {
+        rewrite ^/v2/docker.io/(.*) /v2/$1 break;
+
+        include /etc/nginx/proxy.conf;
+        proxy_cache cache;
+    
+        proxy_set_header Accept-Encoding "";
+        proxy_read_timeout    900;
+        proxy_pass https://registry-1.docker.io/;
+        proxy_redirect ~(.*)\?+(.*) /_fetch/?url=$1&$2;
+    }
+
+    location /v2/library/ {
+        include /etc/nginx/proxy.conf;
+        proxy_cache cache;
+    
+        proxy_set_header Accept-Encoding "";
+        proxy_read_timeout    900;
+        proxy_pass https://registry-1.docker.io;
+        proxy_redirect ~(.*)\?+(.*) /_fetch/?url=$1&$2;
+    }
+
+    location /v2/gcr.io/ {
+        rewrite ^/v2/gcr.io/(.*) /v2/$1 break;
+
+        include /etc/nginx/proxy.conf;
+        proxy_cache cache;
+
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header Authorization "";
+        proxy_read_timeout    900;
+        proxy_pass https://gcr.io/;
+        proxy_redirect ~(.*)\?+(.*) /_fetch/?url=$1&$2;
+    }
+
+    location /v2/quay.io/ {
+        rewrite ^/v2/quay.io/(.*) /v2/$1 break;
+
+        include /etc/nginx/proxy.conf;
+        proxy_cache cache;
+
+        proxy_set_header Accept-Encoding "";
+        proxy_set_header Authorization "";
+        proxy_read_timeout    900;
+        proxy_pass https://quay.io/;
+        proxy_redirect ~(.*)\?+(.*) /_fetch/?url=$1&$2;
+    }
+
+
+    error_page  404              /404.html;
+
+    # redirect server error pages to the static page /50x.html
+    #
+    error_page   500 502 503 504  /50x.html;
+    location = /50x.html {
+        root   /usr/share/nginx/html;
+    }
+}
